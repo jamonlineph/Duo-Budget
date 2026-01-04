@@ -1,11 +1,24 @@
-
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Transaction, PartnerSettings, Payer, CATEGORIES, CURRENCIES } from './types';
+import { Transaction, PartnerSettings, CATEGORIES, CURRENCIES } from './types';
 import { extractTransactionsFromImage } from './services/geminiService';
 import { FileUpload, FileUploadHandle } from './components/FileUpload';
 import { Dashboard } from './components/Dashboard';
 import { TransactionCard } from './components/TransactionCard';
 import { ExportTab } from './components/ExportTab';
+import { auth, db, loginWithGoogle, logoutUser, isFirebaseEnabled } from './services/firebase';
+import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
+import { 
+  collection, 
+  onSnapshot, 
+  query, 
+  orderBy, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  doc, 
+  setDoc,
+  getDoc
+} from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
 import { 
   ReceiptText, 
   Heart, 
@@ -16,291 +29,426 @@ import {
   LayoutDashboard, 
   Plus, 
   Camera, 
-  Image as ImageIcon 
+  Image as ImageIcon,
+  LogOut,
+  CloudCheck,
+  CloudOff,
+  WifiOff,
+  AlertCircle
 } from 'lucide-react';
 
 const App: React.FC = () => {
+  const [user, setUser] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'transactions' | 'export'>('dashboard');
   const [showSettings, setShowSettings] = useState(false);
   const [isActionMenuOpen, setIsActionMenuOpen] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   
   const fileUploadRef = useRef<FileUploadHandle>(null);
 
   const [settings, setSettings] = useState<PartnerSettings>({
-    p1Name: 'Partner 1',
-    p2Name: 'Partner 2',
-    p3Name: 'Partner 3',
+    p1Name: 'Partner A',
+    p2Name: 'Partner B',
     p3Enabled: false,
     currency: '$'
   });
 
-  const [filterCategory, setFilterCategory] = useState<string>('All');
-  const [filterPayer, setFilterPayer] = useState<string>('All');
-  const [searchQuery, setSearchQuery] = useState('');
-
+  // Init Auth
   useEffect(() => {
-    const saved = localStorage.getItem('duobudget_transactions');
-    const savedSettings = localStorage.getItem('duobudget_settings');
-    if (saved) setTransactions(JSON.parse(saved));
-    if (savedSettings) {
-      const parsed = JSON.parse(savedSettings);
-      setSettings({ 
-        ...parsed, 
-        currency: parsed.currency || '$',
-        p3Enabled: !!parsed.p3Enabled,
-        p3Name: parsed.p3Name || 'Partner 3'
+    if (isFirebaseEnabled && auth) {
+      const unsubscribe = onAuthStateChanged(auth, (u) => {
+        setUser(u);
+        setAuthLoading(false);
       });
+      return () => unsubscribe();
+    } else {
+      const local = localStorage.getItem('duo_local_user');
+      if (local) setUser(JSON.parse(local));
+      setAuthLoading(false);
     }
   }, []);
 
+  // Sync Logic
   useEffect(() => {
-    localStorage.setItem('duobudget_transactions', JSON.stringify(transactions));
-  }, [transactions]);
+    if (!user) return;
 
+    if (isFirebaseEnabled && db) {
+      // Cloud Settings
+      const settingsRef = doc(db, 'users', user.uid, 'config', 'settings');
+      getDoc(settingsRef).then(snap => {
+        if (snap.exists()) setSettings(snap.data() as PartnerSettings);
+      });
+
+      // Cloud Transactions
+      setIsSyncing(true);
+      const q = query(collection(db, 'users', user.uid, 'transactions'), orderBy('date', 'desc'));
+      const unsub = onSnapshot(q, (snap) => {
+        const data = snap.docs.map(d => ({ id: d.id, ...d.data() })) as Transaction[];
+        setTransactions(data);
+        setIsSyncing(false);
+      });
+      return () => unsub();
+    } else {
+      // Local Mode
+      const storedTrans = localStorage.getItem(`duo_trans_${user.uid}`);
+      if (storedTrans) setTransactions(JSON.parse(storedTrans));
+      const storedSets = localStorage.getItem(`duo_settings_${user.uid}`);
+      if (storedSets) setSettings(JSON.parse(storedSets));
+    }
+  }, [user]);
+
+  // Persist Local data
   useEffect(() => {
-    localStorage.setItem('duobudget_settings', JSON.stringify(settings));
-  }, [settings]);
-
-  const filteredTransactions = useMemo(() => {
-    return transactions.filter(t => {
-      const matchesCategory = filterCategory === 'All' || t.category === filterCategory;
-      const matchesPayer = filterPayer === 'All' || t.payer === filterPayer;
-      const matchesSearch = t.description.toLowerCase().includes(searchQuery.toLowerCase());
-      return matchesCategory && matchesPayer && matchesSearch;
-    });
-  }, [transactions, filterCategory, filterPayer, searchQuery]);
-
-  const dynamicPayers = useMemo(() => {
-    const standard = ['Partner1', 'Partner2', 'Partner3', 'Shared'];
-    const set = new Set<string>();
-    transactions.forEach(t => {
-      if (!standard.includes(t.payer)) {
-        set.add(t.payer);
-      }
-    });
-    return Array.from(set);
-  }, [transactions]);
+    if (user && !isFirebaseEnabled) {
+      localStorage.setItem(`duo_trans_${user.uid}`, JSON.stringify(transactions));
+      localStorage.setItem(`duo_settings_${user.uid}`, JSON.stringify(settings));
+    }
+  }, [transactions, settings, user]);
 
   const handleFileUpload = async (base64: string) => {
+    if (!user) return;
     setIsLoading(true);
     setIsActionMenuOpen(false);
     try {
       const extracted = await extractTransactionsFromImage(base64);
-      const newTransactions: Transaction[] = extracted.map((t) => ({
-        id: crypto.randomUUID(),
-        date: t.date || new Date().toISOString().split('T')[0],
-        description: t.description || 'Unknown Expense',
-        amount: t.amount || 0,
-        category: t.category || 'Other',
-        payer: 'Shared',
-        originalImage: base64
-      }));
-      setTransactions(prev => [...newTransactions, ...prev]);
-      setActiveTab('transactions');
+      for (const t of extracted) {
+        const newTrans = {
+          date: t.date || new Date().toISOString().split('T')[0],
+          description: t.description || 'Unknown Item',
+          amount: t.amount || 0,
+          category: t.category || 'Other',
+          payer: 'Shared',
+          originalImage: base64
+        };
+
+        if (isFirebaseEnabled && db) {
+          await addDoc(collection(db, 'users', user.uid, 'transactions'), newTrans);
+        } else {
+          setTransactions(prev => [{ ...newTrans, id: Date.now().toString() + Math.random() } as Transaction, ...prev]);
+        }
+      }
     } catch (error) {
-      alert("Failed to extract data. Please check the image quality.");
+      console.error("Error processing receipt:", error);
+      alert("Could not extract data from receipt.");
     } finally {
       setIsLoading(false);
     }
   };
 
-  const updateTransaction = (id: string, updates: Partial<Transaction>) => {
-    setTransactions(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+  const handleUpdateTransaction = async (id: string, updates: Partial<Transaction>) => {
+    if (!user) return;
+    if (isFirebaseEnabled && db) {
+      await updateDoc(doc(db, 'users', user.uid, 'transactions', id), updates);
+    } else {
+      setTransactions(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+    }
   };
 
-  const deleteTransaction = (id: string) => {
-    setTransactions(prev => prev.filter(t => t.id !== id));
+  const handleDeleteTransaction = async (id: string) => {
+    if (!user) return;
+    if (confirm('Are you sure you want to delete this transaction?')) {
+      if (isFirebaseEnabled && db) {
+        await deleteDoc(doc(db, 'users', user.uid, 'transactions', id));
+      } else {
+        setTransactions(prev => prev.filter(t => t.id !== id));
+      }
+    }
   };
+
+  const handleSaveSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    if (isFirebaseEnabled && db) {
+      await setDoc(doc(db, 'users', user.uid, 'config', 'settings'), settings);
+    } else {
+      // Local state already updated
+    }
+    setShowSettings(false);
+  };
+
+  if (authLoading) {
+    return <div className="min-h-screen bg-slate-900 flex items-center justify-center text-white">Loading...</div>;
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 relative overflow-hidden">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(79,70,229,0.15),transparent_50%)]" />
+        <div className="z-10 text-center space-y-8 max-w-md w-full glass-card p-8 rounded-[3rem]">
+          <div className="flex justify-center mb-6">
+            <div className="w-20 h-20 bg-gradient-to-tr from-indigo-500 to-pink-500 rounded-3xl flex items-center justify-center shadow-2xl rotate-3">
+              <Heart className="text-white w-10 h-10 fill-white/20" />
+            </div>
+          </div>
+          <div>
+            <h1 className="text-4xl font-black text-slate-800 tracking-tighter mb-2">DuoBudget</h1>
+            <p className="text-slate-500 font-medium">Financial harmony for couples.</p>
+          </div>
+          
+          <button 
+            onClick={loginWithGoogle}
+            className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold flex items-center justify-center gap-3 hover:scale-[1.02] active:scale-95 transition-all shadow-xl"
+          >
+            <Sparkles size={20} className="text-amber-400" />
+            Continue with Google
+          </button>
+          
+          {!isFirebaseEnabled && (
+            <p className="text-xs text-amber-600 bg-amber-50 p-3 rounded-xl border border-amber-100 flex items-center gap-2">
+              <AlertCircle size={14} />
+              Demo Mode: Data saved locally to device.
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col relative bg-[#F8FAFC]">
-      {/* Invisible handler for file/camera inputs */}
-      <FileUpload ref={fileUploadRef} onUpload={handleFileUpload} isLoading={isLoading} />
-
-      <header className="sticky top-0 z-40 px-4 py-4 backdrop-blur-md bg-white/40 border-b border-slate-200/50">
-        <div className="max-w-5xl mx-auto flex justify-between items-center">
+    <div className="min-h-screen bg-[#F6F8FC] pb-24 sm:pb-0">
+      <div className="max-w-4xl mx-auto min-h-screen flex flex-col">
+        {/* Header */}
+        <header className="px-6 py-6 flex justify-between items-center sticky top-0 z-30 bg-[#F6F8FC]/80 backdrop-blur-xl">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-200">
-              <Heart className="text-white" size={20} fill="currentColor" />
+            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-200">
+              <Heart size={20} className="text-white fill-white/20" />
             </div>
             <div>
-              <h1 className="text-xl font-black text-slate-800 tracking-tight leading-none">DuoBudget</h1>
-              <div className="flex items-center gap-1 mt-1">
-                <Sparkles size={10} className="text-indigo-500" />
-                <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest">AI Tracker</span>
+              <h1 className="text-lg font-black text-slate-800 leading-none tracking-tight">DuoBudget</h1>
+              <div className="flex items-center gap-1.5 mt-1">
+                {isFirebaseEnabled ? (
+                  isSyncing ? (
+                    <span className="flex items-center gap-1 text-[9px] font-black text-indigo-500 uppercase tracking-widest">
+                      <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-ping" />
+                      Syncing...
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-[9px] font-black text-emerald-500 uppercase tracking-widest">
+                      <CloudCheck size={10} />
+                      Cloud Active
+                    </span>
+                  )
+                ) : (
+                  <span className="flex items-center gap-1 text-[9px] font-black text-amber-500 uppercase tracking-widest">
+                    <CloudOff size={10} />
+                    Local Mode
+                  </span>
+                )}
               </div>
             </div>
           </div>
-          
-          <button onClick={() => setShowSettings(true)} className="p-2.5 text-slate-600 hover:text-indigo-600 bg-white border border-slate-200 rounded-xl transition-all shadow-sm">
+          <button 
+            onClick={() => setShowSettings(true)}
+            className="p-3 bg-white rounded-xl shadow-sm border border-slate-100 text-slate-400 hover:text-indigo-600 hover:border-indigo-100 transition-all"
+          >
             <Settings2 size={20} />
           </button>
-        </div>
-      </header>
+        </header>
 
-      <main className="flex-1 max-w-5xl mx-auto w-full px-4 pt-8 pb-40">
-        {activeTab === 'dashboard' ? (
-          <div className="space-y-8 animate-in fade-in duration-500">
-            <Dashboard transactions={transactions} settings={settings} />
-            {transactions.length === 0 && !isLoading && (
-              <div className="glass-card rounded-[3rem] p-12 text-center border-dashed border-2 border-slate-300">
-                <Plus className="mx-auto w-12 h-12 text-slate-300 mb-4" />
-                <h3 className="text-xl font-black text-slate-800 mb-2">No expenses yet</h3>
-                <p className="text-slate-500 font-medium mb-6">Click the Plus button below to scan your first receipt!</p>
+        {/* Content */}
+        <main className="flex-1 px-4 sm:px-6">
+          {activeTab === 'dashboard' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <Dashboard transactions={transactions} settings={settings} />
+            </div>
+          )}
+
+          {activeTab === 'transactions' && (
+            <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-2xl font-black text-slate-800 tracking-tight">Transactions</h2>
+                <span className="text-xs font-black text-slate-400 uppercase tracking-widest">{transactions.length} entries</span>
               </div>
-            )}
-          </div>
-        ) : activeTab === 'transactions' ? (
-          <div className="space-y-6 animate-in slide-in-from-bottom-4 duration-500">
-            <div className="flex flex-col gap-5">
-              <h2 className="text-2xl font-black text-slate-800">History</h2>
-              <div className="glass-card p-4 rounded-[2rem] space-y-4">
-                <input 
-                  type="text" 
-                  placeholder="Search merchant..." 
-                  className="w-full px-5 py-3 bg-white/50 border-slate-200 border rounded-2xl text-sm outline-none font-medium"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-                <div className="flex gap-2">
-                  <select value={filterPayer} onChange={(e) => setFilterPayer(e.target.value)} className="text-[11px] font-black bg-white/50 border-slate-200 rounded-xl px-4 py-2 border outline-none flex-1">
-                    <option value="All">All Payers</option>
-                    <option value="Partner1">{settings.p1Name}</option>
-                    <option value="Partner2">{settings.p2Name}</option>
-                    <option value="Shared">Shared</option>
-                  </select>
-                  <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} className="text-[11px] font-black bg-white/50 border-slate-200 rounded-xl px-4 py-2 border outline-none flex-1">
-                    <option value="All">All Categories</option>
-                    {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
+              {transactions.length === 0 ? (
+                <div className="text-center py-20 opacity-50">
+                  <ReceiptText size={48} className="mx-auto mb-4 text-slate-300" />
+                  <p className="font-bold text-slate-400">No transactions yet</p>
                 </div>
-              </div>
+              ) : (
+                transactions.map(t => (
+                  <TransactionCard 
+                    key={t.id} 
+                    transaction={t} 
+                    settings={settings}
+                    onUpdate={handleUpdateTransaction}
+                    onDelete={handleDeleteTransaction}
+                  />
+                ))
+              )}
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-              {filteredTransactions.map(t => (
-                <TransactionCard key={t.id} transaction={t} settings={settings} onUpdate={updateTransaction} onDelete={deleteTransaction} />
-              ))}
-            </div>
-          </div>
-        ) : (
-          <ExportTab transactions={transactions} settings={settings} />
-        )}
-      </main>
+          )}
 
-      {/* Action Menu Overlay */}
-      {isActionMenuOpen && (
-        <div 
-          className="fixed inset-0 z-[60] bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-200"
-          onClick={() => setIsActionMenuOpen(false)}
-        >
-          <div 
-            className="absolute bottom-32 left-1/2 -translate-x-1/2 w-[90%] max-w-sm glass-card rounded-[2.5rem] p-6 shadow-2xl animate-in slide-in-from-bottom-8 duration-300"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="flex flex-col gap-4">
-              <h3 className="text-sm font-black text-slate-800 uppercase tracking-widest text-center mb-2">New Transaction</h3>
-              <button 
-                onClick={() => fileUploadRef.current?.openCamera()}
-                className="flex items-center gap-4 w-full p-4 bg-indigo-600 text-white rounded-[1.5rem] font-black hover:bg-indigo-700 transition-all active:scale-95 shadow-lg shadow-indigo-100"
-              >
-                <div className="p-3 bg-white/20 rounded-xl"><Camera size={20} /></div>
-                <div className="text-left">
-                  <div className="text-sm">Scan Receipt</div>
-                  <div className="text-[10px] text-white/60 font-medium">Use Camera</div>
-                </div>
-              </button>
-              <button 
-                onClick={() => fileUploadRef.current?.openGallery()}
-                className="flex items-center gap-4 w-full p-4 bg-white border border-slate-200 text-slate-800 rounded-[1.5rem] font-black hover:bg-slate-50 transition-all active:scale-95 shadow-sm"
-              >
-                <div className="p-3 bg-slate-100 rounded-xl text-slate-600"><ImageIcon size={20} /></div>
-                <div className="text-left">
-                  <div className="text-sm">Upload Screenshot</div>
-                  <div className="text-[10px] text-slate-400 font-medium">From Gallery</div>
-                </div>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+          {activeTab === 'export' && (
+             <ExportTab transactions={transactions} settings={settings} />
+          )}
+        </main>
 
-      {/* Global Progress Overlay */}
-      {isLoading && (
-        <div className="fixed inset-0 z-[100] bg-white/80 backdrop-blur-md flex flex-col items-center justify-center p-8">
-          <div className="relative mb-8">
-            <div className="w-20 h-20 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin" />
-            <Sparkles className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-indigo-400" size={32} />
-          </div>
-          <h2 className="text-2xl font-black text-slate-800 text-center mb-2">AI is working...</h2>
-          <p className="text-slate-500 font-medium text-center max-w-xs">Extracting date, merchant, and totals from your image.</p>
-        </div>
-      )}
-
-      {/* Fixed Bottom Navigation */}
-      <nav className="fixed bottom-0 left-0 right-0 z-50 px-6 pb-8 pt-4 pointer-events-none">
-        <div className="max-w-md mx-auto glass-card rounded-[2.5rem] shadow-2xl flex items-center justify-between p-2 pointer-events-auto border-slate-200">
-          <button onClick={() => setActiveTab('dashboard')} className={`flex-1 flex flex-col items-center gap-1.5 py-4 rounded-3xl transition-all ${activeTab === 'dashboard' ? 'text-indigo-600 bg-indigo-50/50' : 'text-slate-400 hover:text-slate-600'}`}>
-            <LayoutDashboard size={22} />
-            <span className="text-[9px] font-black uppercase tracking-widest">Stats</span>
-          </button>
-          <button onClick={() => setActiveTab('transactions')} className={`flex-1 flex flex-col items-center gap-1.5 py-4 rounded-3xl transition-all ${activeTab === 'transactions' ? 'text-indigo-600 bg-indigo-50/50' : 'text-slate-400 hover:text-slate-600'}`}>
-            <ReceiptText size={22} />
-            <span className="text-[9px] font-black uppercase tracking-widest">History</span>
-          </button>
-          
-          {/* Main Action Plus Button */}
-          <div className="px-4 relative -top-6">
+        {/* Navigation / FAB */}
+        <div className="fixed bottom-6 left-6 right-6 sm:left-1/2 sm:-translate-x-1/2 sm:w-full sm:max-w-sm z-40">
+          <div className="glass-card p-2 rounded-[2rem] shadow-2xl flex items-center justify-between relative">
             <button 
-              onClick={() => setIsActionMenuOpen(!isActionMenuOpen)}
-              className={`w-16 h-16 rounded-full flex items-center justify-center shadow-xl shadow-indigo-200 transition-all active:scale-90 border-4 border-white ${isActionMenuOpen ? 'bg-slate-800 rotate-45' : 'bg-indigo-600 rotate-0'}`}
+              onClick={() => setActiveTab('dashboard')}
+              className={`p-4 rounded-[1.5rem] transition-all duration-300 ${activeTab === 'dashboard' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200' : 'text-slate-400 hover:text-slate-600'}`}
             >
-              <Plus size={32} className="text-white" strokeWidth={3} />
+              <LayoutDashboard size={24} strokeWidth={activeTab === 'dashboard' ? 3 : 2} />
+            </button>
+            
+            <div className="relative -top-8">
+              <button 
+                onClick={() => setIsActionMenuOpen(!isActionMenuOpen)}
+                className={`w-16 h-16 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 ${isActionMenuOpen ? 'bg-slate-800 rotate-45' : 'bg-gradient-to-tr from-indigo-500 to-pink-500 hover:scale-110'}`}
+              >
+                <Plus size={32} className="text-white" strokeWidth={3} />
+              </button>
+              
+              {/* Action Menu */}
+              {isActionMenuOpen && (
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4 flex flex-col gap-3 animate-in slide-in-from-bottom-4 fade-in duration-200">
+                  <button 
+                    onClick={() => fileUploadRef.current?.openCamera()}
+                    className="flex items-center gap-3 px-5 py-3 bg-white text-slate-700 rounded-2xl shadow-xl font-bold whitespace-nowrap hover:scale-105 transition-all"
+                  >
+                    <Camera size={18} className="text-indigo-500" />
+                    <span>Scan Receipt</span>
+                  </button>
+                  <button 
+                    onClick={() => fileUploadRef.current?.openGallery()}
+                    className="flex items-center gap-3 px-5 py-3 bg-white text-slate-700 rounded-2xl shadow-xl font-bold whitespace-nowrap hover:scale-105 transition-all"
+                  >
+                    <ImageIcon size={18} className="text-pink-500" />
+                    <span>Upload Image</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <button 
+              onClick={() => setActiveTab('transactions')}
+              className={`p-4 rounded-[1.5rem] transition-all duration-300 ${activeTab === 'transactions' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <ReceiptText size={24} strokeWidth={activeTab === 'transactions' ? 3 : 2} />
+            </button>
+
+            <button 
+              onClick={() => setActiveTab('export')}
+              className={`p-4 rounded-[1.5rem] transition-all duration-300 ${activeTab === 'export' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Download size={24} strokeWidth={activeTab === 'export' ? 3 : 2} />
             </button>
           </div>
-
-          <button onClick={() => setActiveTab('export')} className={`flex-1 flex flex-col items-center gap-1.5 py-4 rounded-3xl transition-all ${activeTab === 'export' ? 'text-indigo-600 bg-indigo-50/50' : 'text-slate-400 hover:text-slate-600'}`}>
-            <Download size={22} />
-            <span className="text-[9px] font-black uppercase tracking-widest">Export</span>
-          </button>
-          <button onClick={() => setShowSettings(true)} className={`flex-1 flex flex-col items-center gap-1.5 py-4 rounded-3xl transition-all text-slate-400 hover:text-slate-600`}>
-            <Settings2 size={22} />
-            <span className="text-[9px] font-black uppercase tracking-widest">Setup</span>
-          </button>
         </div>
-      </nav>
 
-      {/* Settings Modal */}
-      {showSettings && (
-        <div className="fixed inset-0 z-[100] bg-slate-900/30 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="glass-card w-full max-w-sm rounded-[3rem] p-8 relative animate-in zoom-in-95 duration-300">
-            <button onClick={() => setShowSettings(false)} className="absolute top-6 right-6 p-2 text-slate-400 hover:text-slate-600 bg-slate-100 rounded-full"><X size={20} /></button>
-            <h3 className="text-2xl font-black text-slate-800 mb-8">Settings</h3>
-            <div className="space-y-6">
-              <div>
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 block ml-1">Partner 1</label>
-                <input type="text" value={settings.p1Name} onChange={(e) => setSettings({...settings, p1Name: e.target.value})} className="w-full px-5 py-4 bg-white/50 border-slate-200 border rounded-2xl outline-none font-bold"/>
-              </div>
-              <div>
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 block ml-1">Partner 2</label>
-                <input type="text" value={settings.p2Name} onChange={(e) => setSettings({...settings, p2Name: e.target.value})} className="w-full px-5 py-4 bg-white/50 border-slate-200 border rounded-2xl outline-none font-bold"/>
-              </div>
-              <div>
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 block ml-1">Currency</label>
-                <div className="grid grid-cols-4 gap-2">
-                  {CURRENCIES.map(curr => (
-                    <button key={curr.symbol} onClick={() => setSettings({...settings, currency: curr.symbol})} className={`py-3 text-sm font-black rounded-2xl transition-all border ${settings.currency === curr.symbol ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-white text-slate-600 border-slate-200'}`}>
-                      {curr.symbol}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            <button onClick={() => setShowSettings(false)} className="w-full mt-10 py-5 bg-slate-800 text-white rounded-[1.5rem] font-black shadow-lg">Save Settings</button>
+        {/* Loading Overlay */}
+        {isLoading && (
+          <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-md flex flex-col items-center justify-center text-white">
+            <div className="w-16 h-16 border-4 border-white/20 border-t-indigo-500 rounded-full animate-spin mb-4" />
+            <p className="font-black text-xl tracking-tight animate-pulse">Analyzing Receipt...</p>
+            <p className="text-white/50 text-sm mt-2 font-medium">Powered by Gemini 1.5 Flash</p>
           </div>
-        </div>
-      )}
+        )}
+
+        {/* Hidden File Upload Component */}
+        <FileUpload ref={fileUploadRef} onUpload={handleFileUpload} isLoading={isLoading} />
+
+        {/* Settings Modal */}
+        {showSettings && (
+          <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xl flex items-center justify-center p-4">
+            <div className="bg-white w-full max-w-md rounded-[2.5rem] p-6 shadow-2xl max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-2xl font-black text-slate-800">Settings</h3>
+                <button onClick={() => setShowSettings(false)} className="p-2 bg-slate-100 rounded-full text-slate-500 hover:bg-slate-200">
+                  <X size={20} />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveSettings} className="space-y-5">
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2 ml-1">Partner 1 Name</label>
+                    <input 
+                      type="text" 
+                      value={settings.p1Name}
+                      onChange={(e) => setSettings({...settings, p1Name: e.target.value})}
+                      className="w-full px-5 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2 ml-1">Partner 2 Name</label>
+                    <input 
+                      type="text" 
+                      value={settings.p2Name}
+                      onChange={(e) => setSettings({...settings, p2Name: e.target.value})}
+                      className="w-full px-5 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                    />
+                  </div>
+                  
+                  <div className="flex items-center justify-between p-4 bg-slate-50 rounded-xl border border-slate-100">
+                    <span className="font-bold text-slate-700 text-sm">Enable 3rd Partner</span>
+                    <button 
+                      type="button"
+                      onClick={() => setSettings({...settings, p3Enabled: !settings.p3Enabled})}
+                      className={`w-12 h-7 rounded-full transition-colors relative ${settings.p3Enabled ? 'bg-indigo-600' : 'bg-slate-300'}`}
+                    >
+                      <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-transform ${settings.p3Enabled ? 'left-6' : 'left-1'}`} />
+                    </button>
+                  </div>
+
+                  {settings.p3Enabled && (
+                    <div className="animate-in slide-in-from-top-2">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2 ml-1">Partner 3 Name</label>
+                      <input 
+                        type="text" 
+                        value={settings.p3Name || ''}
+                        onChange={(e) => setSettings({...settings, p3Name: e.target.value})}
+                        className="w-full px-5 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-2 ml-1">Currency</label>
+                    <div className="grid grid-cols-4 gap-2">
+                      {CURRENCIES.map(c => (
+                        <button
+                          key={c.name}
+                          type="button"
+                          onClick={() => setSettings({...settings, currency: c.symbol})}
+                          className={`py-2 rounded-xl text-sm font-bold border ${settings.currency === c.symbol ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`}
+                        >
+                          {c.symbol}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="pt-4 border-t border-slate-100 flex flex-col gap-3">
+                  <button 
+                    type="submit"
+                    className="w-full py-4 bg-indigo-600 text-white rounded-xl font-black text-sm uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-indigo-200"
+                  >
+                    Save Changes
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => {
+                        logoutUser();
+                        setShowSettings(false);
+                    }}
+                    className="w-full py-3 text-rose-500 bg-rose-50 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-rose-100 transition-all flex items-center justify-center gap-2"
+                  >
+                    <LogOut size={16} />
+                    Sign Out
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
