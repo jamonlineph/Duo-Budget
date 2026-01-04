@@ -1,0 +1,7 @@
+{
+  "name": "DuoBudget - Couple's AI Expense Tracker",
+  "description": "An AI-powered budget tracker for couples. Upload bank screenshots to automatically extract, categorize, and assign transactions to partners or split them.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
